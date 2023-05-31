@@ -1,6 +1,6 @@
 import pandas as pd
 import matplotlib.pyplot as plt
-import os, time, json, subprocess, sys, threading, re
+import csv, os, time, json, subprocess, sys, threading, re
 import numpy as np
 import datetime as dt
 import matplotlib.dates as mdates
@@ -30,7 +30,7 @@ for item in dirs[:]:
         dirs.remove(item)
     else:
         runs.append(item[item.find(start)+len(start):item.rfind(end)])
-
+dirs = [*set(dirs)]
 
 for run_name in runs:
     res =  subprocess.run(['find '+path+' -type f -name "' +run_name+'.json"'], shell=True, capture_output=True, text=True)
@@ -39,7 +39,7 @@ for run_name in runs:
         if "/systems/" in f:
             with open(f) as f2:
                 data = pd.json_normalize(json.loads(f2.read()))
-                data['run_name'] = run_name
+                data['run_name'] = "/"+run_name+"/"
                 dfs.append(data)
 df = pd.concat(dfs, ignore_index = True)
 names =['run_name','submitter', 'system_name', 'number_of_nodes','accelerators_per_node', 'accelerator_model_name', 'accelerator_memory_capacity', 'accelerator_interconnect'] 
@@ -47,7 +47,7 @@ df = df[names]
 df = df[df['accelerator_model_name'].str.contains(gpu)]
 df = df[df['accelerator_memory_capacity'].str.contains(memory)]
 df.reset_index(drop=True, inplace = True)
-col_names = ["inference_img_p_sec","avg_thput","batch_size","num_epochs","global_batch","epoch_num","run_start", "run_stop", "raw_train_time", "t_seq_per_sec", "train_samples", "eval_samples", 's_p_sec', 'train_batch_size', 'eval_batch_size']
+col_names = ["inference_time","inference_img_p_sec","avg_thput","batch_size","num_epochs","global_batch","epoch_num","run_start", "run_stop", "raw_train_time", "t_seq_per_sec", "train_samples", "eval_samples", 's_p_sec', 'train_batch_size', 'eval_batch_size']
 
 for col in col_names:
     df[col] = 0
@@ -69,25 +69,25 @@ def find_sub(lword, lstr):
 
 def file_parser(line, run):
     t = "\"time_ms\":"
-    if "run_start" in line:
+    if "run_start\"" in line:
         rex = t+"(.*?)"+","
         time = re.search(rex, line)
         time = re.sub("[^0-9]","",time.group(1))
         df.at[run,"run_start"] = int(time)
-    elif "run_stop" in line:
+    elif "run_stop\"" in line:
         rex = t+"(.*?)"+","
         time = re.search(rex, line)
         time = re.sub("[^0-9]","",time.group(1))
         df.at[run,"run_stop"] = int(time)
     
-    elif "train_samples" in line:
+    elif "train_samples" in line and "time_ms" in line:
         t = "train_samples\","
         rex = t+"(.*?)"+","
         time = re.search(rex, line)
         time = re.sub("[^0-9]","",time.group(1))
         df.at[run,"train_samples"] = int(time)
 
-    elif "eval_samples" in line:
+    elif "eval_samples" in line and "time_ms" in line:
         t = "eval_samples\","
         rex = t+"(.*?)"+","
         time = re.search(rex, line)
@@ -133,38 +133,47 @@ def file_parser(line, run):
         if int(df.loc[run]["eval_batch_size"]) < int(time.group(1)) :
             df.at[run,"eval_batch_size"] = int(time.group(1))
 
-    if "img per device" in line:
-        tmp = line.split(" ")
-        df.at[run,"inference_time"] = tmp[7]
-        df.at[run,"inference_img_p_sec"] = tmp[8].replace("(","")
-#        print(tmp[7], "---", tmp[8])
+    if "Total inference time" in line:
+        rex = "time: "+"(.*?)"+"/"
+        time = re.search(rex, line)
+        res = time.group(1)
+        tmp = res.split()
+        df.at[run,"inference_time"] = tmp[0]
+        df.at[run,"inference_img_p_sec"] = tmp[1].replace("(","")
 
     
-def get_thput(line, thput):
-    if "throughput\": " in line:
-        t = "throughput\": "
-        rex = t+"(.*?)"+"}"
+def get_thput(line, thput, timestamp):
+    #if "throughput" in line: #dlrm
+    if "throughput\": " in line:  #markcnn #unet3d
+        print(line)
+        t = "throughput\": " #markcnn
+        rex = t+"(.*?)"+"}"  #markcnn
+        #t = "throughput\", "
+        rex = t+"(.*?)"+"," #uet3d
         time = re.search(rex, line)
         time = re.sub("[^0-9.]","",time.group(1))
         thput.append(float(time))
+        
+        t = "time_ms"
+        rex = t+"(.*?)"+","
+        time = re.search(rex, line)
+        time = re.sub("[^0-9]","",time.group(1))
+        timestamp.append(int(time))
     
-    
-
 def get_param(fname, param, run_name):
     res = set()
     thput=[]
-    with open(fname) as file:
-        try:
-            for line in file:
-                r = find_sub(line,param)
-                res = res.union(r)
-                file_parser(line, run_name)
-                get_thput(line,thput)
-        except UnicodeDecodeError as e:
-            pass
+    timestamp=[]
+    print(fname)
+    with open(fname, encoding='utf-8', errors='ignore') as file:
+        for line in file:
+            r = find_sub(line,param)
+            res = res.union(r)
+            file_parser(line, run_name)
+            get_thput(line, thput, timestamp)
         avg_thput = sum(thput)/len(thput)
         df.at[run_name,'avg_thput'] = avg_thput
-    return res
+    return res, thput, timestamp
 
 
 params=['BATCHSIZE=','batch_size=', '"d_batch_size",','"global_batch_size",', '"local_batch_size"','"epoch_num": ', 'num_epochs=', ]
@@ -177,38 +186,53 @@ def add_to_df(df, run, val):
         
         elif "num_epochs" in v: 
             v = re.sub("[^0-9.]","",v)
-            df.at[run,"num_epochs"] = v
+            df.at[run,"num_epochs"] = float(v)
         
         elif "global_batch" in v: 
             v = re.sub("[^0-9.]","",v)
             df.at[run,"global_batch"] = v
        
-        elif "epoch_num" in v: 
+        elif "epoch_num" in v:
             v = re.sub("[^0-9.]","",v)
-            if int(df.loc[run]["epoch_num"]) < int(v) :
+            if float(df.loc[run]["epoch_num"]) < float(v) :
                 df.at[run,"epoch_num"] = v
 
-system_list = df['run_name']
-df = df.set_index(['run_name'])
+thput_path = "/root/thput_results/"+benchmark_name
+try:
+    os.mkdir(thput_path)
+except OSError as error:
+    print(error)
 
+system_list = list(df['run_name'])
+df = df.set_index(['run_name'])
 for sys in system_list:
     for fname in dirs:
         if sys in fname:
             path = fname + "/result_1.txt" 
-            thput = []        
+            thput = []
             if os.path.isfile(path):
-                res = get_param(path, params, sys)
+                res, thput, timestamp = get_param(path, params, sys)
                 add_to_df(df, sys, res)
-                
+                #name = sys[:-1]
+                p = thput_path  + sys[:-1] + ".csv"
+                with open(p, 'w') as f:
+                    writer = csv.writer(f)
+                    writer.writerows(zip(timestamp, thput))
+
 
 df['run_time'] = df['run_stop'] - df['run_start']
 df['s_p_sec'] = df['train_samples'] / df['run_time']
 df['run_time'] = df['run_time']/1000
 #df['t_seq_per_sec'].round(decimals = 2)
 #df['raw_train_time'].round(decimals = 2)
-print(df[['batch_size','avg_thput']])
+#print(df[['inference_time','inference_img_p_sec']])
 #print(df[['run_start','run_stop','run_time','raw_train_time','t_seq_per_sec','s_p_sec', 'train_samples']])
 df.to_csv(output+".csv")
-quit()
+
+
+
+
+
+
 
 
