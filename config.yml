@@ -1,0 +1,6 @@
+benchmark: bert
+gpu: H100
+memory: 80
+input_dir: /root/training_results_v3.1
+output_dir: results/
+workload: training 
